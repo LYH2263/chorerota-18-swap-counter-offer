@@ -1,5 +1,19 @@
 from app.db import connect
 
+# swap_requests 反提案扩展列: 原案成员快照 + 反案四元组/冻结成员 + 所选案
+SWAP_REQUEST_COLUMNS = {
+    "a_member": "INT", "b_member": "INT",
+    "c_a_day": "INT", "c_a_task": "INT", "c_b_day": "INT", "c_b_task": "INT",
+    "c_a_member": "INT", "c_b_member": "INT",
+    "selected_case": "TEXT",
+}
+
+def _ensure_swap_columns(c):
+    have = {r["name"] for r in c.execute("PRAGMA table_info(swap_requests)")}
+    for col, typ in SWAP_REQUEST_COLUMNS.items():
+        if col not in have:
+            c.execute(f"ALTER TABLE swap_requests ADD COLUMN {col} {typ}")
+
 def init_db():
     c = connect()
     c.executescript("""
@@ -10,6 +24,7 @@ def init_db():
     CREATE TABLE IF NOT EXISTS swap_requests(id INTEGER PRIMARY KEY AUTOINCREMENT, week_id INT, a_day INT, a_task INT, b_day INT, b_task INT, status TEXT, note TEXT);
     CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
     """)
+    _ensure_swap_columns(c)
     if c.execute("SELECT COUNT(*) c FROM members").fetchone()["c"] == 0:
         c.executemany("INSERT INTO members(name,active,data_quality) VALUES (?,?,?)", [
             ("阿明", 1, "clean"), ("小雨", 1, "clean"), ("爷爷", 1, "clean"),

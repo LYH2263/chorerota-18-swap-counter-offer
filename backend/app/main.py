@@ -5,6 +5,7 @@ from pydantic import BaseModel
 from app import seed
 from app.db import connect
 from app.engines.rota import build_week_slots, swap_legal, apply_swap
+from app.modules.swap_counter import validate_counter, resolve_case, project_detail
 
 app = FastAPI(title="Chorerota", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -85,34 +86,76 @@ def request_swap(week_id: int, body: SwapBody):
     if not check["ok"]:
         c.close(); raise HTTPException(400, check["reason"])
     cur = c.execute(
-        "INSERT INTO swap_requests(week_id,a_day,a_task,b_day,b_task,status,note) VALUES (?,?,?,?,?,?,?)",
-        (week_id, body.a_day, body.a_task, body.b_day, body.b_task, "pending", body.note))
+        "INSERT INTO swap_requests(week_id,a_day,a_task,b_day,b_task,status,note,a_member,b_member)"
+        " VALUES (?,?,?,?,?,?,?,?,?)",
+        (week_id, body.a_day, body.a_task, body.b_day, body.b_task, "pending", body.note,
+         check["a_member"], check["b_member"]))
     c.commit(); sid = cur.lastrowid; c.close()
     return {"id": sid, "status": "pending", **check}
 
-@app.get("/api/swaps")
-def list_swaps():
-    c = connect(); rows = [dict(r) for r in c.execute("SELECT * FROM swap_requests ORDER BY id DESC")]; c.close(); return rows
+class CounterBody(BaseModel):
+    a_day: int; a_task: int; b_day: int; b_task: int
 
-@app.post("/api/swaps/{swap_id}/confirm")
-def confirm_swap(swap_id: int):
+@app.post("/api/swaps/{swap_id}/counter")
+def counter_swap(swap_id: int, body: CounterBody):
     c = connect()
     sw = c.execute("SELECT * FROM swap_requests WHERE id=?", (swap_id,)).fetchone()
     if not sw: c.close(); raise HTTPException(404, "swap not found")
     if sw["status"] != "pending":
         c.close(); raise HTTPException(400, "not_pending")
     assigns = [dict(r) for r in c.execute(
+        "SELECT day,task_id,member_id FROM assignments WHERE week_id=?", (sw["week_id"],))]
+    check = validate_counter(assigns, dict(sw), body.a_day, body.a_task, body.b_day, body.b_task)
+    if not check["ok"]:
+        c.close(); raise HTTPException(400, check["reason"])  # 反案非法: 原案不动
+    c.execute(
+        "UPDATE swap_requests SET c_a_day=?,c_a_task=?,c_b_day=?,c_b_task=?,c_a_member=?,c_b_member=?"
+        " WHERE id=?",
+        (body.a_day, body.a_task, body.b_day, body.b_task,
+         check["a_member"], check["b_member"], swap_id))
+    c.commit(); c.close()
+    return {"id": swap_id, "status": "pending", "case": "counter", **check}
+
+@app.get("/api/swaps/{swap_id}")
+def swap_detail(swap_id: int):
+    c = connect()
+    sw = c.execute("SELECT * FROM swap_requests WHERE id=?", (swap_id,)).fetchone()
+    c.close()
+    if not sw: raise HTTPException(404, "swap not found")
+    return project_detail(dict(sw))
+
+@app.get("/api/swaps")
+def list_swaps():
+    c = connect(); rows = [dict(r) for r in c.execute("SELECT * FROM swap_requests ORDER BY id DESC")]; c.close(); return rows
+
+class ConfirmBody(BaseModel):
+    case: str | None = None  # 确认必须显式选案: "original" | "counter"
+
+@app.post("/api/swaps/{swap_id}/confirm")
+def confirm_swap(swap_id: int, body: ConfirmBody = ConfirmBody()):
+    c = connect()
+    sw = c.execute("SELECT * FROM swap_requests WHERE id=?", (swap_id,)).fetchone()
+    if not sw: c.close(); raise HTTPException(404, "swap not found")
+    if sw["status"] != "pending":
+        c.close(); raise HTTPException(400, "not_pending")
+    sel = resolve_case(dict(sw), body.case)
+    if not sel["ok"]:
+        c.close(); raise HTTPException(400, sel["reason"])  # 未选案: 格表不变
+    a_day, a_task, b_day, b_task = sel["tuple"]
+    assigns = [dict(r) for r in c.execute(
         "SELECT id,day,task_id,member_id FROM assignments WHERE week_id=?", (sw["week_id"],))]
     slots = [{"day": a["day"], "task_id": a["task_id"], "member_id": a["member_id"]} for a in assigns]
     try:
-        new_slots = apply_swap(slots, sw["a_day"], sw["a_task"], sw["b_day"], sw["b_task"])
+        new_slots = apply_swap(slots, a_day, a_task, b_day, b_task)
     except ValueError as e:
         c.close(); raise HTTPException(400, str(e))
     for a, s in zip(assigns, new_slots):
         c.execute("UPDATE assignments SET member_id=? WHERE id=?", (s["member_id"], a["id"]))
-    c.execute("UPDATE swap_requests SET status='confirmed' WHERE id=?", (swap_id,))
+    c.execute("UPDATE swap_requests SET status='confirmed', selected_case=? WHERE id=?",
+              (sel["case"], swap_id))
     c.commit(); c.close()
-    return {"ok": True, "swap_id": swap_id}
+    return {"ok": True, "swap_id": swap_id, "selected_case": sel["case"],
+            "a_day": a_day, "a_task": a_task, "b_day": b_day, "b_task": b_task}
 
 @app.get("/api/settings")
 def get_settings():
