@@ -4,7 +4,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from app import seed
 from app.db import connect
-from app.engines.rota import build_week_slots, swap_legal, apply_swap
+from app.engines.rota import build_week_slots, swap_legal
+from app.modules.swap_negotiation.counter import CounterError, validate_counter, persist_counter
+from app.modules.swap_negotiation.confirm import ConfirmError, select_proposal, apply_confirmation
+from app.modules.swap_negotiation.detail import project_swap
 
 app = FastAPI(title="Chorerota", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -85,34 +88,68 @@ def request_swap(week_id: int, body: SwapBody):
     if not check["ok"]:
         c.close(); raise HTTPException(400, check["reason"])
     cur = c.execute(
-        "INSERT INTO swap_requests(week_id,a_day,a_task,b_day,b_task,status,note) VALUES (?,?,?,?,?,?,?)",
-        (week_id, body.a_day, body.a_task, body.b_day, body.b_task, "pending", body.note))
+        """INSERT INTO swap_requests(week_id,a_day,a_task,b_day,b_task,a_member,b_member,status,note)
+           VALUES (?,?,?,?,?,?,?,?,?)""",
+        (week_id, body.a_day, body.a_task, body.b_day, body.b_task,
+         check["a_member"], check["b_member"], "pending", body.note))
     c.commit(); sid = cur.lastrowid; c.close()
     return {"id": sid, "status": "pending", **check}
 
-@app.get("/api/swaps")
-def list_swaps():
-    c = connect(); rows = [dict(r) for r in c.execute("SELECT * FROM swap_requests ORDER BY id DESC")]; c.close(); return rows
+class CounterBody(BaseModel):
+    a_day: int; a_task: int; b_day: int; b_task: int
+    proposed_by: int | None = None
 
-@app.post("/api/swaps/{swap_id}/confirm")
-def confirm_swap(swap_id: int):
+@app.post("/api/swaps/{swap_id}/counter")
+def counter_swap(swap_id: int, body: CounterBody):
+    """对方就 pending 对调提交一套新四元组；反案须重新过合法性，非法不改原 pending。"""
     c = connect()
     sw = c.execute("SELECT * FROM swap_requests WHERE id=?", (swap_id,)).fetchone()
     if not sw: c.close(); raise HTTPException(404, "swap not found")
-    if sw["status"] != "pending":
-        c.close(); raise HTTPException(400, "not_pending")
-    assigns = [dict(r) for r in c.execute(
-        "SELECT id,day,task_id,member_id FROM assignments WHERE week_id=?", (sw["week_id"],))]
-    slots = [{"day": a["day"], "task_id": a["task_id"], "member_id": a["member_id"]} for a in assigns]
     try:
-        new_slots = apply_swap(slots, sw["a_day"], sw["a_task"], sw["b_day"], sw["b_task"])
-    except ValueError as e:
-        c.close(); raise HTTPException(400, str(e))
-    for a, s in zip(assigns, new_slots):
-        c.execute("UPDATE assignments SET member_id=? WHERE id=?", (s["member_id"], a["id"]))
-    c.execute("UPDATE swap_requests SET status='confirmed' WHERE id=?", (swap_id,))
+        q = validate_counter(c, dict(sw), body.model_dump())
+    except CounterError as e:
+        c.close(); raise HTTPException(e.status, e.reason)
+    persist_counter(c, swap_id, q)
     c.commit(); c.close()
-    return {"ok": True, "swap_id": swap_id}
+    return {"id": swap_id, "status": "pending", "counter": {
+        "a_day": q["a_day"], "a_task": q["a_task"], "b_day": q["b_day"], "b_task": q["b_task"],
+        "a_member": q["a_member"], "b_member": q["b_member"],
+    }}
+
+def _member_names(c) -> dict:
+    return {r["id"]: r["name"] for r in c.execute("SELECT id,name FROM members")}
+
+@app.get("/api/swaps")
+def list_swaps():
+    c = connect()
+    names = _member_names(c)
+    rows = [project_swap(dict(r), names)
+            for r in c.execute("SELECT * FROM swap_requests ORDER BY id DESC")]
+    c.close(); return rows
+
+@app.get("/api/swaps/{swap_id}")
+def swap_detail(swap_id: int):
+    c = connect()
+    sw = c.execute("SELECT * FROM swap_requests WHERE id=?", (swap_id,)).fetchone()
+    if not sw: c.close(); raise HTTPException(404, "swap not found")
+    out = project_swap(dict(sw), _member_names(c)); c.close(); return out
+
+class ConfirmBody(BaseModel):
+    # 确认必须显式选择原案或反案；缺省 None 会被分派模块拒绝
+    proposal: str | None = None
+
+@app.post("/api/swaps/{swap_id}/confirm")
+def confirm_swap(swap_id: int, body: ConfirmBody = ConfirmBody()):
+    c = connect()
+    sw = c.execute("SELECT * FROM swap_requests WHERE id=?", (swap_id,)).fetchone()
+    if not sw: c.close(); raise HTTPException(404, "swap not found")
+    try:
+        proposal = select_proposal(body.model_dump() if body else None)
+        result = apply_confirmation(c, dict(sw), proposal)
+    except ConfirmError as e:
+        c.close(); raise HTTPException(e.status, e.reason)
+    c.commit(); c.close()
+    return {"ok": True, **result}
 
 @app.get("/api/settings")
 def get_settings():
